@@ -308,7 +308,7 @@ func (f *Filter) addDirGlobs(Include bool, glob string) error {
 		if err != nil {
 			return err
 		}
-		f.dirRules.add(Include, dirRe)
+		f.dirRules.add(Include, dirRe, dirGlob)
 	}
 	return nil
 }
@@ -329,7 +329,7 @@ func (f *Filter) Add(Include bool, glob string) error {
 		return err
 	}
 	if isFileRule {
-		f.fileRules.add(Include, re)
+		f.fileRules.add(Include, re, glob)
 		// If include rule work out what directories are needed to scan
 		// if exclude rule, we can't rule anything out
 		// Unless it is `*` which matches everything
@@ -342,7 +342,7 @@ func (f *Filter) Add(Include bool, glob string) error {
 		}
 	}
 	if isDirRule {
-		f.dirRules.add(Include, re)
+		f.dirRules.add(Include, re, glob)
 	}
 	return nil
 }
@@ -672,6 +672,42 @@ func (f *Filter) UsesDirectoryFilters() bool {
 		return false
 	}
 	return true
+}
+
+// IncludePrefixes returns a list of literal key prefixes that can be
+// used to constrain a bucket listing to only objects that could
+// possibly match the active include rules.
+//
+// It works by extracting deterministic prefixes from every include
+// rule's glob pattern (via GlobPrefixes). Only root-anchored
+// patterns (starting with "/") yield useful prefixes.
+//
+// Returns nil when:
+//   - there are no include rules with extractable prefixes
+//   - --files-from is in use
+//   - the total number of prefixes exceeds the safety cap
+func (f *Filter) IncludePrefixes() []string {
+	if f.files != nil {
+		return nil // --files-from is active
+	}
+	var allPrefixes []string
+	for _, r := range f.fileRules.rules {
+		if !r.Include || r.Glob == "" {
+			continue
+		}
+		prefixes := GlobPrefixes(r.Glob)
+		if prefixes == nil {
+			continue
+		}
+		allPrefixes = append(allPrefixes, prefixes...)
+		if len(allPrefixes) > maxGlobPrefixes {
+			return nil // too many to be useful
+		}
+	}
+	if len(allPrefixes) == 0 {
+		return nil
+	}
+	return allPrefixes
 }
 
 // Context key for config

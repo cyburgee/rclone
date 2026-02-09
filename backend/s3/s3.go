@@ -48,6 +48,7 @@ import (
 	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/chunksize"
 	"github.com/rclone/rclone/fs/config"
+	"github.com/rclone/rclone/fs/filter"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/fserrors"
@@ -1688,6 +1689,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		SetTier:           provider.StorageClass.Len() > 0,
 		GetTier:           provider.StorageClass.Len() > 0,
 		SlowModTime:       true,
+		FilterAware:       true,
 	}).Fill(ctx, f)
 	if opt.Provider == "AWS" {
 		f.features.DoubleSlash = true
@@ -2163,6 +2165,7 @@ type listOpt struct {
 	versionAt     fs.Time // if set only show versions <= this time
 	noSkipMarkers bool    // if set return dir marker objects
 	restoreStatus bool    // if set return restore status in listing too
+	filterPrefix  string  // if set, appended to directory for the S3 API Prefix (filter-aware optimisation)
 }
 
 // list lists the objects into the function supplied with the opt
@@ -2196,10 +2199,11 @@ func (f *Fs) list(ctx context.Context, opt listOpt, fn listFn) error {
 	// So we enable only on providers we know supports it properly, all others can retry when a
 	// XML Syntax error is detected.
 	urlEncodeListings := f.opt.ListURLEncode.Value
+	apiPrefix := opt.directory + opt.filterPrefix
 	req := s3.ListObjectsV2Input{
 		Bucket:    &opt.bucket,
 		Delimiter: &delimiter,
-		Prefix:    &opt.directory,
+		Prefix:    &apiPrefix,
 		MaxKeys:   &f.opt.ListChunk,
 	}
 	if opt.restoreStatus {
@@ -2467,9 +2471,46 @@ func (f *Fs) ListP(ctx context.Context, dir string, callback fs.ListRCallback) e
 			}
 		}
 	} else {
-		err := f.listDir(ctx, bucket, directory, f.rootDirectory, f.rootBucket == "", list.Add)
-		if err != nil {
-			return err
+		// Check if we can use filter-derived prefixes to constrain the listing
+		var filterPrefixes []string
+		if fi, useFilter := filter.GetConfig(ctx), filter.GetUseFilter(ctx); fi != nil && useFilter {
+			filterPrefixes = fi.IncludePrefixes()
+			if filterPrefixes != nil {
+				fs.Debugf(f, "ListP: using %d filter prefixes to constrain listing of %q", len(filterPrefixes), dir)
+			}
+		}
+		if len(filterPrefixes) > 0 {
+			for _, fp := range filterPrefixes {
+				err := f.list(ctx, listOpt{
+					bucket:       bucket,
+					directory:    directory,
+					prefix:       f.rootDirectory,
+					addBucket:    f.rootBucket == "",
+					withVersions: f.opt.Versions,
+					versionAt:    f.opt.VersionAt,
+					hidden:       f.opt.VersionDeleted,
+					filterPrefix: fp,
+				}, func(remote string, object *types.Object, versionID *string, isDirectory bool) error {
+					entry, err := f.itemToDirEntry(ctx, remote, object, versionID, isDirectory)
+					if err != nil {
+						return err
+					}
+					if entry != nil {
+						return list.Add(entry)
+					}
+					return nil
+				})
+				if err != nil {
+					return err
+				}
+			}
+			// bucket must be present if listing succeeded
+			f.cache.MarkOK(bucket)
+		} else {
+			err := f.listDir(ctx, bucket, directory, f.rootDirectory, f.rootBucket == "", list.Add)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	return list.Flush()
@@ -2494,7 +2535,7 @@ func (f *Fs) ListP(ctx context.Context, dir string, callback fs.ListRCallback) e
 func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (err error) {
 	bucket, directory := f.split(dir)
 	list := list.NewHelper(callback)
-	listR := func(bucket, directory, prefix string, addBucket bool) error {
+	listR := func(bucket, directory, prefix string, addBucket bool, filterPrefix string) error {
 		return f.list(ctx, listOpt{
 			bucket:       bucket,
 			directory:    directory,
@@ -2504,6 +2545,7 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (
 			withVersions: f.opt.Versions,
 			versionAt:    f.opt.VersionAt,
 			hidden:       f.opt.VersionDeleted,
+			filterPrefix: filterPrefix,
 		}, func(remote string, object *types.Object, versionID *string, isDirectory bool) error {
 			entry, err := f.itemToDirEntry(ctx, remote, object, versionID, isDirectory)
 			if err != nil {
@@ -2511,6 +2553,14 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (
 			}
 			return list.Add(entry)
 		})
+	}
+	// Check if we can use filter-derived prefixes to constrain the listing
+	var filterPrefixes []string
+	if fi, useFilter := filter.GetConfig(ctx), filter.GetUseFilter(ctx); fi != nil && useFilter {
+		filterPrefixes = fi.IncludePrefixes()
+		if filterPrefixes != nil {
+			fs.Debugf(f, "ListR: using %d filter prefixes to constrain listing", len(filterPrefixes))
+		}
 	}
 	if bucket == "" {
 		entries, err := f.listBuckets(ctx)
@@ -2523,7 +2573,7 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (
 				return err
 			}
 			bucket := entry.Remote()
-			err = listR(bucket, "", f.rootDirectory, true)
+			err = listR(bucket, "", f.rootDirectory, true, "")
 			if err != nil {
 				return err
 			}
@@ -2531,9 +2581,18 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (
 			f.cache.MarkOK(bucket)
 		}
 	} else {
-		err = listR(bucket, directory, f.rootDirectory, f.rootBucket == "")
-		if err != nil {
-			return err
+		if len(filterPrefixes) > 0 {
+			for _, fp := range filterPrefixes {
+				err = listR(bucket, directory, f.rootDirectory, f.rootBucket == "", fp)
+				if err != nil {
+					return err
+				}
+			}
+		} else {
+			err = listR(bucket, directory, f.rootDirectory, f.rootBucket == "", "")
+			if err != nil {
+				return err
+			}
 		}
 		// bucket must be present if listing succeeded
 		f.cache.MarkOK(bucket)
