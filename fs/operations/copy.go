@@ -335,6 +335,10 @@ func (c *copy) copy(ctx context.Context) (newDst fs.Object, err error) {
 		}
 	}
 	if err != nil {
+		if errors.Is(err, fs.ErrorObjectNotFound) {
+			fs.Logf(c.src, "Source object not found - likely deleted during sync, skipping")
+			return newDst, nil
+		}
 		err = fs.CountError(ctx, err)
 		fs.Errorf(c.src, "Failed to copy: %v", err)
 		if !c.inplace {

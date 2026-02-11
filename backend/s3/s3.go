@@ -4,6 +4,7 @@ package s3
 //go:generate go run gen_setfrom.go -o setfrom.go
 
 import (
+	"compress/gzip"
 	"context"
 	"crypto/md5"
 	"crypto/tls"
@@ -50,6 +51,7 @@ import (
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
+	"github.com/rclone/rclone/fs/filter"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
@@ -1269,6 +1271,50 @@ func (s3logger) Logf(classification logging.Classification, format string, v ...
 	}
 }
 
+// gzipFixRoundTripper works around S3-compatible providers (e.g. behind
+// Cloudflare) that return gzipped error responses despite the request
+// containing Accept-Encoding: identity. Without this, the AWS SDK
+// tries to parse the raw gzip bytes as XML and fails with
+// "illegal character code U+001F".
+//
+// Only 404 responses are decompressed; successful
+// responses are left alone so that rclone's own gzip/object handling
+// (--s3-decompress, acceptEncoding, etc.) is not affected.
+type gzipFixRoundTripper struct {
+	rt http.RoundTripper
+}
+
+func (w *gzipFixRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := w.rt.RoundTrip(req)
+	if err != nil {
+		return resp, err
+	}
+	if resp.StatusCode == 404 && strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
+		gz, gzErr := gzip.NewReader(resp.Body)
+		if gzErr != nil {
+			// Can't decompress – return the original response and
+			// let the SDK deal with it as before.
+			return resp, nil
+		}
+		resp.Body = gzipReadCloser{gz, resp.Body}
+		resp.Header.Del("Content-Encoding")
+		resp.ContentLength = -1
+	}
+	return resp, nil
+}
+
+// gzipReadCloser closes both the gzip reader and the underlying body.
+type gzipReadCloser struct {
+	gz   *gzip.Reader
+	body io.ReadCloser
+}
+
+func (r gzipReadCloser) Read(p []byte) (int, error) { return r.gz.Read(p) }
+func (r gzipReadCloser) Close() error {
+	_ = r.gz.Close()
+	return r.body.Close()
+}
+
 // s3Connection makes a connection to s3
 func s3Connection(ctx context.Context, opt *Options, client *http.Client) (s3Client *s3.Client, provider *Provider, err error) {
 	ci := fs.GetConfig(ctx)
@@ -1356,6 +1402,9 @@ func s3Connection(ctx context.Context, opt *Options, client *http.Client) (s3Cli
 
 	setQuirks(opt, provider)
 	awsConfig.RetryMaxAttempts = ci.LowLevelRetries
+	// Wrap the HTTP transport to decompress gzipped error responses
+	// from providers that ignore Accept-Encoding: identity.
+	client.Transport = &gzipFixRoundTripper{rt: client.Transport}
 	awsConfig.HTTPClient = client
 
 	options := []func(*s3.Options){}
@@ -1688,6 +1737,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		SetTier:           provider.StorageClass.Len() > 0,
 		GetTier:           provider.StorageClass.Len() > 0,
 		SlowModTime:       true,
+		FilterAware:       true,
 	}).Fill(ctx, f)
 	if opt.Provider == "AWS" {
 		f.features.DoubleSlash = true
@@ -2163,6 +2213,7 @@ type listOpt struct {
 	versionAt     fs.Time // if set only show versions <= this time
 	noSkipMarkers bool    // if set return dir marker objects
 	restoreStatus bool    // if set return restore status in listing too
+	filterPrefix  string  // if set, appended to directory for the S3 API Prefix (filter-aware optimisation)
 }
 
 // list lists the objects into the function supplied with the opt
@@ -2196,10 +2247,11 @@ func (f *Fs) list(ctx context.Context, opt listOpt, fn listFn) error {
 	// So we enable only on providers we know supports it properly, all others can retry when a
 	// XML Syntax error is detected.
 	urlEncodeListings := f.opt.ListURLEncode.Value
+	apiPrefix := opt.directory + opt.filterPrefix
 	req := s3.ListObjectsV2Input{
 		Bucket:    &opt.bucket,
 		Delimiter: &delimiter,
-		Prefix:    &opt.directory,
+		Prefix:    &apiPrefix,
 		MaxKeys:   &f.opt.ListChunk,
 	}
 	if opt.restoreStatus {
@@ -2467,9 +2519,46 @@ func (f *Fs) ListP(ctx context.Context, dir string, callback fs.ListRCallback) e
 			}
 		}
 	} else {
-		err := f.listDir(ctx, bucket, directory, f.rootDirectory, f.rootBucket == "", list.Add)
-		if err != nil {
-			return err
+		// Check if we can use filter-derived prefixes to constrain the listing
+		var filterPrefixes []string
+		if fi, useFilter := filter.GetConfig(ctx), filter.GetUseFilter(ctx); fi != nil && useFilter {
+			filterPrefixes = fi.IncludePrefixes()
+			if filterPrefixes != nil {
+				fs.Debugf(f, "ListP: using %d filter prefixes to constrain listing of %q", len(filterPrefixes), dir)
+			}
+		}
+		if len(filterPrefixes) > 0 {
+			for _, fp := range filterPrefixes {
+				err := f.list(ctx, listOpt{
+					bucket:       bucket,
+					directory:    directory,
+					prefix:       f.rootDirectory,
+					addBucket:    f.rootBucket == "",
+					withVersions: f.opt.Versions,
+					versionAt:    f.opt.VersionAt,
+					hidden:       f.opt.VersionDeleted,
+					filterPrefix: fp,
+				}, func(remote string, object *types.Object, versionID *string, isDirectory bool) error {
+					entry, err := f.itemToDirEntry(ctx, remote, object, versionID, isDirectory)
+					if err != nil {
+						return err
+					}
+					if entry != nil {
+						return list.Add(entry)
+					}
+					return nil
+				})
+				if err != nil {
+					return err
+				}
+			}
+			// bucket must be present if listing succeeded
+			f.cache.MarkOK(bucket)
+		} else {
+			err := f.listDir(ctx, bucket, directory, f.rootDirectory, f.rootBucket == "", list.Add)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	return list.Flush()
@@ -2494,7 +2583,7 @@ func (f *Fs) ListP(ctx context.Context, dir string, callback fs.ListRCallback) e
 func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (err error) {
 	bucket, directory := f.split(dir)
 	list := list.NewHelper(callback)
-	listR := func(bucket, directory, prefix string, addBucket bool) error {
+	listR := func(bucket, directory, prefix string, addBucket bool, filterPrefix string) error {
 		return f.list(ctx, listOpt{
 			bucket:       bucket,
 			directory:    directory,
@@ -2504,6 +2593,7 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (
 			withVersions: f.opt.Versions,
 			versionAt:    f.opt.VersionAt,
 			hidden:       f.opt.VersionDeleted,
+			filterPrefix: filterPrefix,
 		}, func(remote string, object *types.Object, versionID *string, isDirectory bool) error {
 			entry, err := f.itemToDirEntry(ctx, remote, object, versionID, isDirectory)
 			if err != nil {
@@ -2511,6 +2601,14 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (
 			}
 			return list.Add(entry)
 		})
+	}
+	// Check if we can use filter-derived prefixes to constrain the listing
+	var filterPrefixes []string
+	if fi, useFilter := filter.GetConfig(ctx), filter.GetUseFilter(ctx); fi != nil && useFilter {
+		filterPrefixes = fi.IncludePrefixes()
+		if filterPrefixes != nil {
+			fs.Debugf(f, "ListR: using %d filter prefixes to constrain listing", len(filterPrefixes))
+		}
 	}
 	if bucket == "" {
 		entries, err := f.listBuckets(ctx)
@@ -2523,7 +2621,7 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (
 				return err
 			}
 			bucket := entry.Remote()
-			err = listR(bucket, "", f.rootDirectory, true)
+			err = listR(bucket, "", f.rootDirectory, true, "")
 			if err != nil {
 				return err
 			}
@@ -2531,9 +2629,18 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (
 			f.cache.MarkOK(bucket)
 		}
 	} else {
-		err = listR(bucket, directory, f.rootDirectory, f.rootBucket == "")
-		if err != nil {
-			return err
+		if len(filterPrefixes) > 0 {
+			for _, fp := range filterPrefixes {
+				err = listR(bucket, directory, f.rootDirectory, f.rootBucket == "", fp)
+				if err != nil {
+					return err
+				}
+			}
+		} else {
+			err = listR(bucket, directory, f.rootDirectory, f.rootBucket == "", "")
+			if err != nil {
+				return err
+			}
 		}
 		// bucket must be present if listing succeeded
 		f.cache.MarkOK(bucket)
@@ -4079,6 +4186,9 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		}
 	}
 	if err != nil {
+		if getHTTPStatusCode(err) == http.StatusNotFound {
+			return nil, fs.ErrorObjectNotFound
+		}
 		return nil, err
 	}
 

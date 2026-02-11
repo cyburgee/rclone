@@ -25,6 +25,7 @@ type RulesOpt struct {
 type rule struct {
 	Include bool
 	Regexp  *regexp.Regexp
+	Glob    string // original glob pattern (set when added via Add)
 }
 
 // Match returns true if rule matches path
@@ -50,13 +51,14 @@ type rules struct {
 type addFn func(Include bool, glob string) error
 
 // add adds a rule if it doesn't exist already
-func (rs *rules) add(Include bool, re *regexp.Regexp) {
+func (rs *rules) add(Include bool, re *regexp.Regexp, glob string) {
 	if rs.existing == nil {
 		rs.existing = make(map[string]struct{})
 	}
 	newRule := rule{
 		Include: Include,
 		Regexp:  re,
+		Glob:    glob,
 	}
 	newRuleString := newRule.String()
 	if _, ok := rs.existing[newRuleString]; ok {
@@ -72,7 +74,7 @@ func (rs *rules) Add(Include bool, glob string) error {
 	if err != nil {
 		return err
 	}
-	rs.add(Include, re)
+	rs.add(Include, re, glob)
 	return nil
 }
 

@@ -952,3 +952,61 @@ func TestGetConfig(t *testing.T) {
 	ctx3 := ReplaceConfig(ctx, f)
 	assert.Equal(t, globalConfig, GetConfig(ctx3))
 }
+
+func TestIncludePrefixes(t *testing.T) {
+	for i, test := range []struct {
+		includes []string
+		want     []string
+	}{
+		// No rules → nil.
+		{
+			includes: nil,
+			want:     nil,
+		},
+		// Single anchored include with character class.
+		{
+			includes: []string{"/[0-1]**"},
+			want:     []string{"0", "1"},
+		},
+		// Single anchored include with literal prefix.
+		{
+			includes: []string{"/abc**"},
+			want:     []string{"abc"},
+		},
+		// Non-anchored include → nil (can't safely extract prefix).
+		{
+			includes: []string{"[0-1]**"},
+			want:     nil,
+		},
+		// Multiple anchored includes → union of prefixes.
+		{
+			includes: []string{"/[0-1]**", "/[a-b]**"},
+			want:     []string{"0", "1", "a", "b"},
+		},
+		// Mix of anchored and non-anchored → only anchored contribute.
+		{
+			includes: []string{"/[0-1]**", "[a-b]**"},
+			want:     []string{"0", "1"},
+		},
+		// Anchored include with wildcard-only → nil (no useful prefix).
+		{
+			includes: []string{"/**"},
+			want:     nil,
+		},
+		// Anchored include with alternation.
+		{
+			includes: []string{"/{x,y,z}**"},
+			want:     []string{"x", "y", "z"},
+		},
+	} {
+		what := fmt.Sprintf("#%d includes=%v", i, test.includes)
+		f, err := NewFilter(nil)
+		require.NoError(t, err)
+		for _, inc := range test.includes {
+			err := f.Add(true, inc)
+			require.NoError(t, err, what)
+		}
+		got := f.IncludePrefixes()
+		assert.Equal(t, test.want, got, what)
+	}
+}
