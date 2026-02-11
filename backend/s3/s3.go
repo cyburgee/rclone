@@ -4,6 +4,7 @@ package s3
 //go:generate go run gen_setfrom.go -o setfrom.go
 
 import (
+	"compress/gzip"
 	"context"
 	"crypto/md5"
 	"crypto/tls"
@@ -48,9 +49,9 @@ import (
 	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/chunksize"
 	"github.com/rclone/rclone/fs/config"
-	"github.com/rclone/rclone/fs/filter"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
+	"github.com/rclone/rclone/fs/filter"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
@@ -1270,6 +1271,50 @@ func (s3logger) Logf(classification logging.Classification, format string, v ...
 	}
 }
 
+// gzipFixRoundTripper works around S3-compatible providers (e.g. behind
+// Cloudflare) that return gzipped error responses despite the request
+// containing Accept-Encoding: identity. Without this, the AWS SDK
+// tries to parse the raw gzip bytes as XML and fails with
+// "illegal character code U+001F".
+//
+// Only error responses (HTTP status >= 300) are decompressed; successful
+// responses are left alone so that rclone's own gzip/object handling
+// (--s3-decompress, acceptEncoding, etc.) is not affected.
+type gzipFixRoundTripper struct {
+	rt http.RoundTripper
+}
+
+func (w *gzipFixRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := w.rt.RoundTrip(req)
+	if err != nil {
+		return resp, err
+	}
+	if resp.StatusCode >= 300 && strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
+		gz, gzErr := gzip.NewReader(resp.Body)
+		if gzErr != nil {
+			// Can't decompress – return the original response and
+			// let the SDK deal with it as before.
+			return resp, nil
+		}
+		resp.Body = gzipReadCloser{gz, resp.Body}
+		resp.Header.Del("Content-Encoding")
+		resp.ContentLength = -1
+	}
+	return resp, nil
+}
+
+// gzipReadCloser closes both the gzip reader and the underlying body.
+type gzipReadCloser struct {
+	gz   *gzip.Reader
+	body io.ReadCloser
+}
+
+func (r gzipReadCloser) Read(p []byte) (int, error) { return r.gz.Read(p) }
+func (r gzipReadCloser) Close() error {
+	_ = r.gz.Close()
+	return r.body.Close()
+}
+
 // s3Connection makes a connection to s3
 func s3Connection(ctx context.Context, opt *Options, client *http.Client) (s3Client *s3.Client, provider *Provider, err error) {
 	ci := fs.GetConfig(ctx)
@@ -1357,6 +1402,9 @@ func s3Connection(ctx context.Context, opt *Options, client *http.Client) (s3Cli
 
 	setQuirks(opt, provider)
 	awsConfig.RetryMaxAttempts = ci.LowLevelRetries
+	// Wrap the HTTP transport to decompress gzipped error responses
+	// from providers that ignore Accept-Encoding: identity.
+	client.Transport = &gzipFixRoundTripper{rt: client.Transport}
 	awsConfig.HTTPClient = client
 
 	options := []func(*s3.Options){}
