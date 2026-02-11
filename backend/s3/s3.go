@@ -4186,6 +4186,9 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		}
 	}
 	if err != nil {
+		if getHTTPStatusCode(err) == http.StatusNotFound {
+			return nil, fs.ErrorObjectNotFound
+		}
 		return nil, err
 	}
 
