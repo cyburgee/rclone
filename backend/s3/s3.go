@@ -1277,7 +1277,7 @@ func (s3logger) Logf(classification logging.Classification, format string, v ...
 // tries to parse the raw gzip bytes as XML and fails with
 // "illegal character code U+001F".
 //
-// Only error responses (HTTP status >= 300) are decompressed; successful
+// Only 404 responses are decompressed; successful
 // responses are left alone so that rclone's own gzip/object handling
 // (--s3-decompress, acceptEncoding, etc.) is not affected.
 type gzipFixRoundTripper struct {
@@ -1289,7 +1289,7 @@ func (w *gzipFixRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 	if err != nil {
 		return resp, err
 	}
-	if resp.StatusCode >= 300 && strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
+	if resp.StatusCode == 404 && strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
 		gz, gzErr := gzip.NewReader(resp.Body)
 		if gzErr != nil {
 			// Can't decompress – return the original response and
